@@ -11,6 +11,7 @@ size_t eval(std::span<const uint32_t> values, uint32_t predicate){
     for (const auto val : values){
         result += val == predicate;
     }
+    //std::cout << " Eval for " << predicate << " : " << result << std::endl;
     return result;
 }
 
@@ -28,12 +29,13 @@ int main(int argc, char** argv){
 
     std::vector<std::vector<std::byte>> indexes(data->num_chunks);
     size_t storage_size = 0;
+    std::cout << "Building indexes for " << data->num_chunks << " chunks." << std::endl;
     for (size_t i=0; i!=data->num_chunks; i++){
         indexes[i] = build_idx(data->getChunk(i), p);
         storage_size += indexes[i].size();
     }
     storage_size = (storage_size + 1023) / 1024;
-
+    std::cout << "running queries: " << queries->num_queries << std::endl;
     size_t num_skips = 0;
     for (size_t i=0; i!=queries->num_queries; i++){
         uint32_t predicate = queries->values[i];
