@@ -82,7 +82,7 @@ struct SimpleBloom {
         }
         return true;
     }
-    
+
 };
 
 struct CountMinSketch {
@@ -220,7 +220,7 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
         }
         remaining_budget -= bloom_bytes;
         // get bloom filter params
-        BloomParams bp = bloom_params_for(freq_map.size() - chosen_set.size(), 0.6); // target 60% false-positive rate
+        BloomParams bp = bloom_params_for(freq_map.size() - chosen_set.size(), 0.1); // target 10% false-positive rate
         size_t bloom_bits =  bp.m_bits;
         size_t hash_count =  static_cast<size_t>(bp.k_hashes);
         SimpleBloom bloom{bloom_bits, hash_count};
@@ -235,6 +235,7 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
         uint32_t min_key = UINT32_MAX;
         uint32_t max_key = 0;
         for (const auto &key : freq_map) {
+            if (!bloom.might_contain(key.first)) continue;
             if (chosen_set.find(key.first) == chosen_set.end()) {
                 if (key.first < min_key) min_key = key.first;
                 if (key.first > max_key) max_key = key.first;
