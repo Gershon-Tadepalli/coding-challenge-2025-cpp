@@ -57,24 +57,32 @@ struct SimpleBloom {
         return x ^ (x >> 31);
     }
 
+    // insert using double hashing: (h1 + i * h2) mod m
     void insert(uint32_t value) {
+        if (bits == 0) return;
+        uint64_t h1 = splitmix64(static_cast<uint64_t>(value));
+        uint64_t h2 = splitmix64(static_cast<uint64_t>(value ^ 0x9e3779b97f4a7c15ULL));
         for (size_t i = 0; i < hash_count; ++i) {
-            uint64_t hash = splitmix64(static_cast<uint64_t>(value) + i * rand_num);
-            size_t pos = hash % bits;
+            uint64_t combined = h1 + static_cast<uint64_t>(i) * h2;
+            size_t pos = combined % bits;
             set_bit(pos);
         }
     }
 
     bool might_contain(uint32_t value) const {
+        if (bits == 0) return true;
+        uint64_t h1 = splitmix64(static_cast<uint64_t>(value));
+        uint64_t h2 = splitmix64(static_cast<uint64_t>(value ^ 0x9e3779b97f4a7c15ULL));
         for (size_t i = 0; i < hash_count; ++i) {
-            uint64_t hash = splitmix64(static_cast<uint64_t>(value) + i * rand_num);
-            size_t pos = hash % bits;
+            uint64_t combined = h1 + static_cast<uint64_t>(i) * h2;
+            size_t pos = combined % bits;
             if (!get_bit(pos)) {
                 return false;
             }
         }
         return true;
     }
+    
 };
 
 struct CountMinSketch {
@@ -212,9 +220,8 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
         }
         remaining_budget -= bloom_bytes;
         // get bloom filter params
-        BloomParams bp = bloom_params_for(freq_map.size() - chosen_set.size(), 0.03);
+        BloomParams bp = bloom_params_for(freq_map.size() - chosen_set.size(), 0.6); // target 60% false-positive rate
         size_t bloom_bits =  bp.m_bits;
-        // size_t bloom_bits =  static_cast<uint32_t>(bloom_bytes * 8);
         size_t hash_count =  static_cast<size_t>(bp.k_hashes);
         SimpleBloom bloom{bloom_bits, hash_count};
         if (bloom.bits > 0){
@@ -224,7 +231,6 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
                 }
             }
         }
-
         // range index
         uint32_t min_key = UINT32_MAX;
         uint32_t max_key = 0;
@@ -256,9 +262,7 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
         // size_t cms_table_size = cms.width * cms.depth * sizeof(uint32_t);
         
         // serialize layout:
-        // [flag (1 byte)] [topk_count:uint32][topk keys (delta+varint)][topk freqs (varint sequence)] |[bloom_bits:uint32][bloom_hash:uint32][bloom bytes..] | [range.Min,range.Max] (8 bytes) |
-        uint8_t flag = 1;
-        append_bytes(serialized, &flag, sizeof(flag));
+        // [topk_count:uint32][topk keys (delta+varint)][topk freqs (varint sequence)] |[bloom_bits:uint32][bloom_hash:uint32][bloom bytes..] | [range.Min,range.Max] (8 bytes) |
 
         // serialize top-k : sort ascending keys and delta+varint encode
         std::sort(topk.begin(), topk.end(), [](const auto &a, const auto &b){ return a.first < b.first; });
@@ -297,9 +301,6 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
 
 std::optional<size_t> query_idx(uint32_t predicate, const std::vector<std::byte>& index){
     size_t offset = 0;
-    uint8_t flag;
-    std::memcpy(&flag, index.data() + offset, sizeof(flag));
-    offset += sizeof(flag);
        // bloom filter + top-k + range index
        // top-k check
        uint32_t topk_count;
