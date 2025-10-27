@@ -175,32 +175,15 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
         std::vector<std::byte> serialized;
 
         // header flag + bloom filter + top-k + range index
-        // query-aware benefit analysis
-        std::unordered_map<uint32_t, uint32_t> query_freq;
-        try{
-            InMemoryFile qfile(config.filename + ".query");
-            const QueryFile* qf = reinterpret_cast<const QueryFile*>(qfile.begin());
-            if(qf) {
-                for (size_t i = 0; i < qf->num_queries; ++i) {
-                    uint32_t v = qf->values[i];
-                    query_freq[v]++;
-                }
-            }
-        } catch (...) {
-
-        }
 
         // pick top-k freq's
         struct Candidate { uint32_t key; uint32_t count; double net_gain;};
         std::vector<Candidate> candidates;
         candidates.reserve(freq_map.size());
         for (auto &p : freq_map) {
-            uint32_t qf = 0;
-            auto it = query_freq.find(p.first);
-            if (it != query_freq.end()) qf = it->second;
-            double benefit = double(p.second) * double(qf + 1);
+            double benefit = double(p.second * p.second) * double(config.f_a);
             double net = benefit - double(entry_size) * double(config.f_s);
-            candidates.push_back({p.first, p.second, benefit});
+            if (net > 0.0) candidates.push_back({p.first, p.second, net});
         }
 
         //sort by net-gain descending
