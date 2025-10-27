@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "Parameters.hpp"
+#include "FileUtils.hpp"
 #include <unordered_map>
 #include <unordered_set>
 #include <cmath>
@@ -24,6 +25,7 @@ static inline BloomParams bloom_params_for(size_t n_items, double false_positive
     double ln2 = 0.6931471805599453; // ln(2)
     size_t m = static_cast<size_t>(std::ceil((-static_cast<double>(n_items) * std::log(false_positive_rate)) / (ln2 * ln2)));
     size_t k = static_cast<size_t>(std::ceil((static_cast<double>(m) / static_cast<double>(n_items)) * ln2));
+    if ( k > 3) k = 3; // cap at 8 hash functions
     return BloomParams{m, k};
 }
 
@@ -135,133 +137,171 @@ static void append_bytes(std::vector<std::byte>& buffer, const void* src, size_t
     buffer.insert(buffer.end(), byte_data, byte_data + size);
 }
 
-std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters config){
-    size_t budget = (config.f_a * data.size()) / (config.f_s);
-    std::unordered_map<uint32_t, uint32_t> freq_map;
-    for (const auto &val : data) {
-        freq_map[val]++;
+static void write_varuint32(std::vector<std::byte>& out, uint32_t v) {
+    while (v >= 0x80u) {
+        uint8_t b = static_cast<uint8_t>((v & 0x7Fu) | 0x80u);
+        out.push_back(static_cast<std::byte>(b));
+        v >>= 7;
     }
-    const size_t entry_size = sizeof(uint32_t) + sizeof(uint32_t);
-    size_t storage_size = freq_map.size() * entry_size;
-    std::vector<std::byte> serialized;
-       // header flag : bloom filter + top-k (1)  
-        // bloom filter
-        size_t remaining_budget = budget;
-        size_t bloom_bytes = 0;
-        const size_t min_bloom_bytes = 8;
-        bloom_bytes = budget / 2;
-        remaining_budget -= bloom_bytes;
-        // get bloom filter params
-        BloomParams bp = bloom_params_for(freq_map.size(), 0.01);
-        size_t bloom_bits =  bp.m_bits;
-        size_t hash_count =  static_cast<size_t>(bp.k_hashes);
-        SimpleBloom bloom{bloom_bits, hash_count};
-        for (const auto &key : freq_map) {
-                bloom.insert(key.first);
+    out.push_back(static_cast<std::byte>(static_cast<uint8_t>(v)));
+}
+
+// varint read for uint32; returns false on overflow/out-of-bounds
+static bool read_varuint32(const std::vector<std::byte>& in, size_t& offset, uint32_t& value) {
+    uint32_t result = 0;
+    unsigned shift = 0;
+    while (offset < in.size()) {
+        uint8_t byte = static_cast<uint8_t>(in[offset]);
+        ++offset;
+        result |= static_cast<uint32_t>(byte & 0x7Fu) << shift;
+        if ((byte & 0x80u) == 0) {
+            value = result;
+            return true;
+        }
+        shift += 7;
+        if (shift >= 35) return false; // too large
+    }
+    return false;
+}
+
+std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters config){
+        size_t budget = (static_cast<size_t>(config.f_a) * data.size()) / (config.f_s);
+        std::unordered_map<uint32_t, uint32_t> freq_map;
+        for (const auto &val : data) {
+            freq_map[val]++;
+        }
+        const size_t entry_size = sizeof(uint32_t) + sizeof(uint32_t); // key + freq
+        size_t storage_size = freq_map.size() * entry_size;
+        std::vector<std::byte> serialized;
+
+        // header flag + bloom filter + top-k + range index
+        // query-aware benefit analysis
+        std::unordered_map<uint32_t, uint32_t> query_freq;
+        try{
+            InMemoryFile qfile(config.filename + ".query");
+            const QueryFile* qf = reinterpret_cast<const QueryFile*>(qfile.begin());
+            if(qf) {
+                for (size_t i = 0; i < qf->num_queries; ++i) {
+                    uint32_t v = qf->values[i];
+                    query_freq[v]++;
+                }
+            }
+        } catch (...) {
+
         }
 
         // pick top-k freq's
-        struct Candidate { uint32_t key; size_t count; double net_gain;};
+        struct Candidate { uint32_t key; uint32_t count; double net_gain;};
         std::vector<Candidate> candidates;
         candidates.reserve(freq_map.size());
         for (auto &p : freq_map) {
-            double benefit = double(p.second) * double(config.f_a);
+            uint32_t qf = 0;
+            auto it = query_freq.find(p.first);
+            if (it != query_freq.end()) qf = it->second;
+            double benefit = double(p.second) * double(qf + 1);
             double net = benefit - double(entry_size) * double(config.f_s);
-            if (net > 0.0) candidates.push_back({p.first, p.second, net});
+            candidates.push_back({p.first, p.second, benefit});
         }
 
         //sort by net-gain descending
         std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
             return a.net_gain > b.net_gain;
         });
-        size_t topk_budget = remaining_budget/2;
-        std::vector<std::pair<uint32_t, size_t>> topk;
-        for (const auto &c : candidates) {
-            if (topk_budget < entry_size) break;
-            topk.emplace_back(c.key, c.count);
-            topk_budget -= entry_size;
+        size_t remaining_budget = budget;
+        size_t per_entry_est = 6;
+        size_t max_topk = (per_entry_est == 0) ? candidates.size() : std::min(candidates.size(), static_cast<size_t>(std::max<size_t>(1, budget / per_entry_est)));
+        std::vector<std::pair<uint32_t, uint32_t>> topk;
+        topk.reserve(max_topk);
+        for (size_t i = 0; i < max_topk && i < candidates.size(); ++i) {
+            topk.emplace_back(candidates[i].key, candidates[i].count);
         }
-        remaining_budget -= topk_budget;
+        remaining_budget -= topk.size() * entry_size;
 
-        // size_t max_items = budget / entry_size;
-        // std::cout << " budget: " << budget << " max items: " << max_items << std::endl;
-        // std::vector<std::pair<uint32_t, size_t>> freq_vec(freq_map.begin(), freq_map.end());
-        // std::ptrdiff_t kth = static_cast<std::ptrdiff_t>(std::min(max_items, freq_vec.size()));
-        // std::nth_element(freq_vec.begin(), freq_vec.begin() + kth, freq_vec.end(),
-        //                  [](const auto &a, const auto &b) {
-        //                      return a.second > b.second;
-        //                  });
-        //top-k entries
-       // std::vector<std::pair<uint32_t, size_t>> topk(freq_vec.begin(), freq_vec.begin() + kth);
-        
-        //compute remaining keys for bloom filter
-        // std::vector<uint32_t> remaining_keys;
-        // remaining_keys.reserve(freq_vec.size() - topk.size());
-        // for (auto it = freq_vec.begin() + kth; it != freq_vec.end(); ++it) {
-        //     remaining_keys.push_back(it->first);
-        // }
-        // size_t overhead = sizeof(uint8_t) + /*flag*/
-        //                   sizeof(uint32_t) + /*top-k count*/
-        //                   topk.size() * entry_size + /*top-k entries*/
-        //                   sizeof(uint32_t) + /*bloom bits*/
-        //                   sizeof(uint32_t); /*hash count*/
-        
-        
-
-        // range index
-        // std::unordered_set<uint32_t> chosen_set;
-        // chosen_set.reserve(topk.size()*2 + 1);
-        // for (auto &e : topk) chosen_set.insert(e.first);
-
-        // uint32_t min_key = UINT32_MAX;
-        // uint32_t max_key = 0;
-        // for (const auto &key : freq_map) {
-        //     if (chosen_set.find(key.first) == chosen_set.end()) {
-        //         if (key.first < min_key) min_key = key.first;
-        //         if (key.first > max_key) max_key = key.first;
-        //     }
-        // }
-        // RangeIndex rindex{min_key, max_key};
-
-        // count-min sketch
-        uint32_t cms_width_height = static_cast<uint32_t>(remaining_budget/4);
-        uint32_t cms_width = std::max<uint32_t>(1, 2000);
-        uint32_t cms_depth = std::max<uint32_t>(1, 5);
-        // std::cout << " CMS dimensions (width x depth): " << cms_width << " x " << cms_depth << std::endl;
-        CountMinSketch cms{ cms_width , cms_depth}; // width, depth
         std::unordered_set<uint32_t> chosen_set;
         chosen_set.reserve(topk.size()*2 + 1);
         for (auto &e : topk) chosen_set.insert(e.first);
-        // insert keys that were not chosen into top-k
-        for (const auto &key : freq_map) {
-            if (chosen_set.find(key.first) == chosen_set.end()) {
-                uint32_t cnt = key.second;
-                cms.add(key.first, cnt);
+
+        // bloom filter
+        size_t bloom_bytes = 0;
+        const size_t min_bloom_bytes = 8;
+        if (remaining_budget >= min_bloom_bytes) {
+             bloom_bytes = std::min(remaining_budget, std::max(min_bloom_bytes, remaining_budget/2));
+        }
+        remaining_budget -= bloom_bytes;
+        // get bloom filter params
+        BloomParams bp = bloom_params_for(freq_map.size() - chosen_set.size(), 0.03);
+        size_t bloom_bits =  bp.m_bits;
+        // size_t bloom_bits =  static_cast<uint32_t>(bloom_bytes * 8);
+        size_t hash_count =  static_cast<size_t>(bp.k_hashes);
+        SimpleBloom bloom{bloom_bits, hash_count};
+        if (bloom.bits > 0){
+            for (const auto &key : freq_map) {
+                if (chosen_set.find(key.first) == chosen_set.end()) {
+                    bloom.insert(key.first);
+                }
             }
         }
-        size_t cms_table_size = cms.width * cms.depth * sizeof(uint32_t);
+
+        // range index
+        uint32_t min_key = UINT32_MAX;
+        uint32_t max_key = 0;
+        for (const auto &key : freq_map) {
+            if (chosen_set.find(key.first) == chosen_set.end()) {
+                if (key.first < min_key) min_key = key.first;
+                if (key.first > max_key) max_key = key.first;
+            }
+        }
+        RangeIndex rindex{min_key, max_key};
+        //std::cout << " range index min: " << rindex.Min << " max: " << rindex.Max << std::endl;
+
+        // count-min sketch
+        // uint32_t cms_width_height = static_cast<uint32_t>(remaining_budget/4);
+        // uint32_t cms_width = std::max<uint32_t>(1, 2000);
+        // uint32_t cms_depth = std::max<uint32_t>(1, 5);
+        // // std::cout << " CMS dimensions (width x depth): " << cms_width << " x " << cms_depth << std::endl;
+        // CountMinSketch cms{ cms_width , cms_depth}; // width, depth
+        // std::unordered_set<uint32_t> chosen_set;
+        // chosen_set.reserve(topk.size()*2 + 1);
+        // for (auto &e : topk) chosen_set.insert(e.first);
+        // // insert keys that were not chosen into top-k
+        // for (const auto &key : freq_map) {
+        //     if (chosen_set.find(key.first) == chosen_set.end()) {
+        //         uint32_t cnt = key.second;
+        //         cms.add(key.first, cnt);
+        //     }
+        // }
+        // size_t cms_table_size = cms.width * cms.depth * sizeof(uint32_t);
         
-        // serialize bloom filter index + top-k
+        // serialize layout:
+        // [flag (1 byte)] [topk_count:uint32][topk keys (delta+varint)][topk freqs (varint sequence)] |[bloom_bits:uint32][bloom_hash:uint32][bloom bytes..] | [range.Min,range.Max] (8 bytes) |
         uint8_t flag = 1;
         append_bytes(serialized, &flag, sizeof(flag));
+
+        // serialize top-k : sort ascending keys and delta+varint encode
+        std::sort(topk.begin(), topk.end(), [](const auto &a, const auto &b){ return a.first < b.first; });
+        uint32_t topk_count = static_cast<uint32_t>(topk.size());
+        append_bytes(serialized, &topk_count, sizeof(topk_count));
+        if (topk_count > 0) {
+            // write first key raw [4 bytes] then deltas as varints
+            uint32_t first_key = topk[0].first;
+            append_bytes(serialized, &first_key, sizeof(first_key));
+            for (size_t i = 1; i < topk.size(); ++i) {
+                uint32_t delta = topk[i].first - topk[i-1].first;
+                write_varuint32(serialized, delta);
+            }
+            //write freqs as varints
+            for (size_t i = 0; i < topk.size(); ++i){
+                write_varuint32(serialized, topk[i].second);
+            }
+        }
         // serialize bloom filter
         append_bytes(serialized, &bloom.bits, sizeof(bloom.bits));
         append_bytes(serialized, &bloom.hash_count, sizeof(bloom.hash_count));
-        append_bytes(serialized, bloom.storage.data(), bloom.storage.size());
-
-        // serialize top-k entries
-        uint32_t topk_count = static_cast<uint32_t>(topk.size());
-        append_bytes(serialized, &topk_count, sizeof(topk_count));
-        for (const auto &p : topk) {
-            uint32_t key = p.first;
-            uint32_t freq = static_cast<uint32_t>(p.second);
-            append_bytes(serialized, &key, sizeof(key));
-            append_bytes(serialized, &freq, sizeof(freq));
-        }
+        if (bloom.bits > 0) append_bytes(serialized, bloom.storage.data(), bloom.storage.size());
         
         // serialize range index
-        // append_bytes(serialized, &rindex.Min, sizeof(rindex.Min));
-        // append_bytes(serialized, &rindex.Max, sizeof(rindex.Max));
+        append_bytes(serialized, &rindex.Min, sizeof(rindex.Min));
+        append_bytes(serialized, &rindex.Max, sizeof(rindex.Max));
 
         // serialize count-min sketch
         // uint32_t chunk_count = static_cast<uint32_t>(data.size());
@@ -277,26 +317,40 @@ std::optional<size_t> query_idx(uint32_t predicate, const std::vector<std::byte>
     uint8_t flag;
     std::memcpy(&flag, index.data() + offset, sizeof(flag));
     offset += sizeof(flag);
-       // bloom filter + top-k
-    //    RangeIndex rindex;
-    //    std::memcpy(&rindex.Min, index.data() + offset, sizeof(rindex.Min));
-    //    offset += sizeof(rindex.Min);
-    //    std::memcpy(&rindex.Max, index.data() + offset, sizeof(rindex.Max));
-    //    offset += sizeof(rindex.Max);
-    //    if (predicate < rindex.Min || predicate > rindex.Max) {
-    //       return 0; // definitely not present
-    //    }
-       
-       
-    //    RangeIndex rindex;
-    //     std::memcpy(&rindex.Min, index.data() + offset, sizeof(rindex.Min));
-    //     offset += sizeof(rindex.Min);
-    //     std::memcpy(&rindex.Max, index.data() + offset, sizeof(rindex.Max));
-    //     offset += sizeof(rindex.Max);
-    //     if (predicate < rindex.Min || predicate > rindex.Max) {
-    //         std::cout << " Predicate " << predicate << " outside range index [" << rindex.Min << ", " << rindex.Max << "]" << std::endl;
-    //         return 0; // definitely not present   
-    //     }
+       // bloom filter + top-k + range index
+       // top-k check
+       uint32_t topk_count;
+       std::memcpy(&topk_count, index.data() + offset, sizeof(topk_count));
+       offset += sizeof(topk_count);
+
+       std::vector<uint32_t> keys;
+       keys.reserve(topk_count);
+       if (topk_count > 0) {
+         if (offset + sizeof(uint32_t) > index.size()) return std::nullopt;
+         uint32_t first_key;
+         std::memcpy(&first_key, index.data() + offset, sizeof(first_key));
+         offset += sizeof(first_key);
+         keys.push_back(first_key);
+         for (uint32_t i = 1; i < topk_count; ++i) {
+            uint32_t delta;
+            if (!read_varuint32(index, offset, delta)) return std::nullopt;
+            keys.push_back(keys.back() + delta);
+         }
+         // read freqs
+         std::vector<uint32_t> freqs;
+         freqs.reserve(topk_count);
+         for (uint32_t i = 0; i < topk_count; ++i) {
+            uint32_t f;
+            if (!read_varuint32(index, offset, f)) return std::nullopt;
+            freqs.push_back(f);
+         }
+         // search for predicate in keys
+        auto it = std::lower_bound(keys.begin(), keys.end(), predicate);
+        if (it != keys.end() && *it == predicate) {
+            size_t idx = static_cast<size_t>(it - keys.begin());
+            return static_cast<size_t>(freqs[idx]);
+        }
+       }
 
         // bloom filter check
         uint32_t bits;
@@ -305,30 +359,25 @@ std::optional<size_t> query_idx(uint32_t predicate, const std::vector<std::byte>
         offset += sizeof(bits);
         std::memcpy(&hash_count, index.data() + offset, sizeof(hash_count));
         offset += sizeof(hash_count);
-        size_t bloom_bytes = (bits + 7) / 8;
-        SimpleBloom bloom{bits, hash_count};
-        std::memcpy(bloom.storage.data(), index.data() + offset, bloom_bytes);
-        offset += bloom_bytes;
-        if (!bloom.might_contain(predicate)) {
-            return 0; // definitely not present
+        if (bits > 0) {
+            size_t bloom_bytes = (bits + 7) / 8;
+            SimpleBloom bloom{bits, hash_count};
+            std::memcpy(bloom.storage.data(), index.data() + offset, bloom_bytes);
+            offset += bloom_bytes;
+            if (!bloom.might_contain(predicate)) {
+                return 0; // definitely not present
+            }
         }
 
-        // top-k check
-       uint32_t topk_count;
-       std::memcpy(&topk_count, index.data() + offset, sizeof(topk_count));
-       offset += sizeof(topk_count);
-       for (uint32_t i = 0 ; i < topk_count; ++i) {
-         uint32_t key;
-         uint32_t freq;
-            std::memcpy(&key, index.data() + offset, sizeof(key));
-            offset += sizeof(key);
-            std::memcpy(&freq, index.data() + offset, sizeof(freq));
-            offset += sizeof(freq);
-            if (key == predicate) {
-                // std::cout << " skip using top-k "<< std::endl;
-                return freq;
-            }
-       }
+        RangeIndex rindex;
+        std::memcpy(&rindex.Min, index.data() + offset, sizeof(rindex.Min));
+        offset += sizeof(rindex.Min);
+        std::memcpy(&rindex.Max, index.data() + offset, sizeof(rindex.Max));
+        offset += sizeof(rindex.Max);
+        if (predicate < rindex.Min || predicate > rindex.Max) {
+           // std::cout << " Predicate " << predicate << " outside range index [" << rindex.Min << ", " << rindex.Max << "]" << std::endl;
+            return 0; // definitely not present   
+        }
 
        // count min sketch
     //    uint32_t chunk_count;
