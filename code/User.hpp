@@ -201,10 +201,40 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
         size_t remaining_budget = budget;
         size_t per_entry_est = 6;
         size_t max_topk = (per_entry_est == 0) ? candidates.size() : std::min(candidates.size(), static_cast<size_t>(std::max<size_t>(1, budget / per_entry_est)));
+        // heavy / tail split
+        const double heavy_frac = 0.75;
+        size_t heavy_count = static_cast<size_t>(std::ceil(max_topk * heavy_frac));
+        if (heavy_count > candidates.size()) heavy_count = candidates.size();
+        size_t tail_count = max_topk - heavy_count;
+
+        // pick heavy by net gain
         std::vector<std::pair<uint32_t, uint32_t>> topk;
         topk.reserve(max_topk);
-        for (size_t i = 0; i < max_topk && i < candidates.size(); ++i) {
+        for (size_t i = 0; i < heavy_count && i < candidates.size(); ++i) {
             topk.emplace_back(candidates[i].key, candidates[i].count);
+        }
+
+        // pick tail 
+        if (tail_count > 0) {
+            // build vector of keys not already selected
+            std::unordered_set<uint32_t> chosen_tmp;
+            chosen_tmp.reserve(topk.size()*2 + 1);
+            for (auto &e : topk) chosen_tmp.insert(e.first);
+
+            std::vector<std::pair<uint32_t, uint32_t>> tail_candidates;
+            tail_candidates.reserve(freq_map.size());
+            for (auto &kv : freq_map) {
+                if (chosen_tmp.find(kv.first) == chosen_tmp.end()) {
+                    tail_candidates.emplace_back(kv.first, kv.second);
+                }
+            }
+            // sort tail candidates by ascending frequency
+            std::sort(tail_candidates.begin(), tail_candidates.end(),
+                    [](const auto &a, const auto &b) { return a.second < b.second; });
+            // take up tail_count least frequent keys
+            for (size_t i =0; i< tail_count && i < tail_candidates.size(); ++i) {
+                topk.emplace_back(tail_candidates[i].first, tail_candidates[i].second);
+            }
         }
         remaining_budget -= topk.size() * entry_size;
 
@@ -216,11 +246,12 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
         size_t bloom_bytes = 0;
         const size_t min_bloom_bytes = 8;
         if (remaining_budget >= min_bloom_bytes) {
-             bloom_bytes = std::min(remaining_budget, std::max(min_bloom_bytes, remaining_budget/2));
+             bloom_bytes = std::min(remaining_budget, static_cast<size_t>(remaining_budget*0.7));
         }
         remaining_budget -= bloom_bytes;
         // get bloom filter params
         BloomParams bp = bloom_params_for(freq_map.size() - chosen_set.size(), 0.1); // target 10% false-positive rate
+        bp.k_hashes = std::min<size_t>(bp.k_hashes, 5); // cap at 5 hash functions
         size_t bloom_bits =  bp.m_bits;
         size_t hash_count =  static_cast<size_t>(bp.k_hashes);
         SimpleBloom bloom{bloom_bits, hash_count};
