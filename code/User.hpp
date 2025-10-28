@@ -194,10 +194,6 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
             if (net > 0.0) candidates.push_back({p.first, p.second, net});
         }
 
-        //sort by net-gain descending
-        std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-            return a.net_gain > b.net_gain;
-        });
         size_t remaining_budget = budget;
         size_t per_entry_est = 6;
         size_t max_topk = (per_entry_est == 0) ? candidates.size() : std::min(candidates.size(), static_cast<size_t>(std::max<size_t>(1, budget / per_entry_est)));
@@ -210,6 +206,14 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
         // pick heavy by net gain
         std::vector<std::pair<uint32_t, uint32_t>> topk;
         topk.reserve(max_topk);
+        if (!candidates.empty() && heavy_count > 0) {
+            if (heavy_count < candidates.size()) {
+                std::nth_element(candidates.begin(),
+                            candidates.begin() + static_cast<std::ptrdiff_t>(heavy_count),
+                            candidates.end(),
+                            [](const Candidate &a, const Candidate &b) { return a.net_gain > b.net_gain; });
+            }
+        }
         for (size_t i = 0; i < heavy_count && i < candidates.size(); ++i) {
             topk.emplace_back(candidates[i].key, candidates[i].count);
         }
@@ -228,9 +232,14 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
                     tail_candidates.emplace_back(kv.first, kv.second);
                 }
             }
-            // sort tail candidates by ascending frequency
-            std::sort(tail_candidates.begin(), tail_candidates.end(),
-                    [](const auto &a, const auto &b) { return a.second < b.second; });
+            if (!tail_candidates.empty()) {
+                if (tail_count < tail_candidates.size()) {
+                    std::nth_element(tail_candidates.begin(),
+                                tail_candidates.begin() + static_cast<std::ptrdiff_t>(tail_count),
+                                tail_candidates.end(),
+                                [](const auto &a, const auto &b) { return a.second < b.second; });
+                }
+            }
             // take up tail_count least frequent keys
             for (size_t i =0; i< tail_count && i < tail_candidates.size(); ++i) {
                 topk.emplace_back(tail_candidates[i].first, tail_candidates[i].second);
