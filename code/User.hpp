@@ -11,135 +11,152 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cmath>
-
-const uint64_t rand_num = 0x9e3779b97f4a7c15ULL;
+#include <functional>
 
 struct RangeIndex {
     uint32_t Min, Max;
 };
 
-struct BloomParams { size_t m_bits; size_t k_hashes; size_t byte_size() const { return (m_bits + 7) / 8; }};
+/*
+* SBBF - Split Block Bloom Filter
+* A bloom filter variant that splits the bloom filter into multiple blocks
+* Each block is a standard bloom filter of 256 bits (8 words of 32 bits
+* each). Each block uses 8 hash functions to set/check bits.
+* The block to use is selected by multiplying the hash value by the number
+* of blocks and taking the top bits.
+*/
+struct BloomBlock {
+    struct BloomMaskResult {
+        //8 bit positions in each of the 8 words to set/check
+        uint8_t bit_set[8] = {0};
+    };
 
-static inline BloomParams bloom_params_for(size_t n_items, double false_positive_rate) {
-    assert(false_positive_rate > 0.0 && false_positive_rate < 1.0);
-    double ln2 = 0.6931471805599453; // ln(2)
-    size_t m = static_cast<size_t>(std::ceil((-static_cast<double>(n_items) * std::log(false_positive_rate)) / (ln2 * ln2)));
-    size_t k = static_cast<size_t>(std::ceil((static_cast<double>(m) / static_cast<double>(n_items)) * ln2));
-    if ( k > 3) k = 3; // cap at 8 hash functions
-    return BloomParams{m, k};
-}
+    //bitset vector
+    uint32_t block[8] = {0}; // 8 words of 32 bits each = 256 bits
+
+    //set bit i in x
+    static void set_bit(uint32_t &x, const uint8_t i) {
+       assert ( i < 32);
+       x |= (uint32_t) 1 << i;
+    }
+
+    //check if bit i is set in x
+    static bool check_bit(uint32_t &x, const uint8_t i) {
+        assert (i < 32);
+        return (x >> i) & (uint32_t)1;
+    }
+
+    // find the bit positions to set for each of the 8 hash functions
+    static BloomMaskResult Mask(uint32_t x) {
+        static const uint32_t bloom_salt[8] = {
+            0x47b6137bU, 0x44974d91U, 0x8824ad5bU, 0xa2b7289dU,
+            0x705495c7U, 0x2df1424bU, 0x9efc4947U, 0x5c6bfb31U
+        };
+        BloomMaskResult result;
+        //find the 8 words bit positions to set/check
+        for (uint8_t i = 0; i < 8; ++i) {
+            result.bit_set[i] = (x * bloom_salt[i]) >> 27; // top 5 bits ranging from 0-31
+        }
+        return result;
+    }
+
+    /*
+    * Insert x into bloom block
+    * Use 8 hash functions to set bits in each of the 8 words
+    */
+    static void BlockInsert(BloomBlock &b, uint32_t x) {
+        auto masked = Mask(x);
+        for (size_t i = 0; i < 8; i++)
+        {
+            set_bit(b.block[i], masked.bit_set[i]);
+        }     
+    }
+
+    /*
+    * Check x in the bloom block
+    * Use 8 hash functions to check bits in each of the 8 words are set
+    */
+    static bool BlockCheck(BloomBlock &b, uint32_t x) {
+       auto masked = Mask(x);
+       for (size_t i = 0; i < 8; i++)
+       {
+           if (!check_bit(b.block[i], masked.bit_set[i])) {
+               return false;
+           }
+       }
+       return true;
+    }
+};
 
 struct SimpleBloom {
-    std::vector<uint8_t> storage; // packed bytes
-    uint32_t bits;
-    uint32_t hash_count;
+    static constexpr const uint64_t DEFAULT_BLOCK_COUNT = 32;
+    std::vector<BloomBlock> data;
+    uint64_t block_count;
 
-    SimpleBloom(uint32_t bits_, uint32_t hash_count_) : bits(bits_), hash_count(hash_count_) {
-        storage.assign((bits + 7) / 8, 0);
+    SimpleBloom(uint64_t num_entries, double false_positive_rate) {
+       double f = false_positive_rate;
+       double k = 8.0;
+       double n = num_entries;
+       double m = -k * n / std::log(1 - std::pow(f, 1/k));
+       auto b = std::max(NextPowerOfTwo(m / k) / 32, 1);
+       assert ( b > 0 && IsPowerOfTwo(b));
+       block_count = b;
+       data.assign(static_cast<size_t>(block_count), BloomBlock{});
     }
 
-    void set_bit(size_t pos) {
-        size_t byte_index = pos / 8;
-        size_t bit_index = pos % 8;
-        storage[byte_index] |= (1 << bit_index);
+    SimpleBloom(std::vector<BloomBlock> &&v) : data(std::move(v)), block_count(data.size()) {}
+    
+    BloomBlock* blocks() { return data.data();}
+
+    bool IsPowerOfTwo(uint64_t v) {
+	    return (v & (v - 1)) == 0;
     }
 
-    bool get_bit(size_t pos) const {
-        size_t byte_index = pos / 8;
-        size_t bit_index = pos % 8;
-        return (storage[byte_index] & (1 << bit_index)) != 0;
-    }
-
-    static uint64_t splitmix64(uint64_t x) {
-        x += rand_num;
-        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-        return x ^ (x >> 31);
-    }
-
-    // insert using double hashing: (h1 + i * h2) mod m
-    void insert(uint32_t value) {
-        if (bits == 0) return;
-        uint64_t h1 = splitmix64(static_cast<uint64_t>(value));
-        uint64_t h2 = splitmix64(static_cast<uint64_t>(value ^ 0x9e3779b97f4a7c15ULL));
-        for (size_t i = 0; i < hash_count; ++i) {
-            uint64_t combined = h1 + static_cast<uint64_t>(i) * h2;
-            size_t pos = combined % bits;
-            set_bit(pos);
+    int NextPowerOfTwo(uint64_t v) {
+        auto v_in = v;
+        if (v < 1) { // this is not strictly right but we seem to rely on it in places
+            return 2;
         }
-    }
-
-    bool might_contain(uint32_t value) const {
-        if (bits == 0) return true;
-        uint64_t h1 = splitmix64(static_cast<uint64_t>(value));
-        uint64_t h2 = splitmix64(static_cast<uint64_t>(value ^ 0x9e3779b97f4a7c15ULL));
-        for (size_t i = 0; i < hash_count; ++i) {
-            uint64_t combined = h1 + static_cast<uint64_t>(i) * h2;
-            size_t pos = combined % bits;
-            if (!get_bit(pos)) {
-                return false;
-            }
+        v--;
+        v |= v >> 1;
+        v |= v >> 2;
+        v |= v >> 4;
+        v |= v >> 8;
+        v |= v >> 16;
+        v |= v >> 32;
+        v++;
+        if (v == 0) {
+            std::cout << "Can't find next power of 2 for " << v_in << std::endl;
         }
-        return true;
+        return v;
     }
 
-};
-
-struct CountMinSketch {
-    uint32_t width;
-    uint32_t depth;
-    double base; // base > 1.0 (e.g. 1.08..1.2)
-    std::vector<uint32_t> table; // flattened 2D array: depth x width
-
-    CountMinSketch(uint32_t width_, uint32_t depth_) : width(width_), depth(depth_) {
-        double error = 0.01;
-        double delta = 0.01;
-        base = 1.08;
-        const double e = 2.71828182845904523536;
-        width = static_cast<uint32_t>(std::ceil(e / error));
-        depth = static_cast<uint32_t>(std::ceil(std::log(1.0 / delta)));
-        if (width < 1) width = 1;
-        if (depth < 1) depth = 1;
-        table.assign(width * depth, 0);
+    /*
+    * Insert x into bloom filter
+    * 64 bit input x
+    * Multiply x by block_count and take top bits to select block
+    * Use lower 32 bits of x for bloom block insert
+    */
+    void FilterInsert(uint64_t x) {
+        uint64_t i = (x * block_count) >> 32;
+        auto &b = data[i];
+        return BloomBlock::BlockInsert(b, (uint32_t)x);
     }
 
-    static uint64_t hash(uint32_t value, size_t seed) {
-        uint64_t x = static_cast<uint64_t>(value) + seed * rand_num;
-        return SimpleBloom::splitmix64(x);
-    }
-
-    void add(uint32_t value, uint32_t count = 1) {
-        for (uint32_t c = 0; c < count; ++c) {
-            for (size_t i = 0; i < depth; ++i) {
-            uint64_t h = hash(value, i);
-            size_t index = h % width;
-            size_t pos = i * width + index;
-            uint8_t c = table[pos];
-            // compute probability
-            double p = std::pow(base, -static_cast<int>(c));
-            double r = static_cast<double>(rand()) / static_cast<double>(RAND_MAX);
-            if (r < p && c < UINT8_MAX) {
-                table[pos] = c + 1;
-            }
-        } 
-      }
-    }
-
-    uint32_t estimate(uint32_t value) const {
-        uint32_t min_estimate = UINT32_MAX;
-        for (size_t i = 0; i < depth; ++i) {
-            uint64_t h = hash(value, i);
-            size_t index = h % width;
-            size_t pos = i * width + index;
-            uint8_t c = table[pos];
-            // inverse morris estimator: (base^c - 1) / (base -1)
-            double est = (std::pow(base, static_cast<int>(c)) - 1.0) / (base - 1.0);
-            min_estimate = static_cast<uint32_t>(std::ceil(est));
-        }
-        return min_estimate == UINT32_MAX ? 0 : min_estimate;
+    /*
+    * Check for x in the bloom filter
+    * 64 bit input x
+    * Multiply x by block_count and take top bits to select block
+    * Use lower 32 bits of x for bloom block check
+    */
+    bool FilterCheck(uint64_t x) {
+        uint64_t i = (x * block_count) >> 32;
+        auto &b = data[i];
+        return BloomBlock::BlockCheck(b, (uint32_t)x);
     }
 };
 
+// append raw bytes to buffer
 static void append_bytes(std::vector<std::byte>& buffer, const void* src, size_t size) {
     const std::byte* byte_data = reinterpret_cast<const std::byte*>(src);
     buffer.insert(buffer.end(), byte_data, byte_data + size);
@@ -183,7 +200,6 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
         std::vector<std::byte> serialized;
 
         // header flag + bloom filter + top-k + range index
-
         // pick top-k freq's
         struct Candidate { uint32_t key; uint32_t count; double net_gain;};
         std::vector<Candidate> candidates;
@@ -252,58 +268,27 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
         for (auto &e : topk) chosen_set.insert(e.first);
 
         // bloom filter
-        size_t bloom_bytes = 0;
-        const size_t min_bloom_bytes = 8;
-        if (remaining_budget >= min_bloom_bytes) {
-             bloom_bytes = std::min(remaining_budget, static_cast<size_t>(remaining_budget*0.7));
-        }
-        remaining_budget -= bloom_bytes;
-        // get bloom filter params
-        BloomParams bp = bloom_params_for(freq_map.size() - chosen_set.size(), 0.1); // target 10% false-positive rate
-        bp.k_hashes = std::min<size_t>(bp.k_hashes, 5); // cap at 5 hash functions
-        size_t bloom_bits =  bp.m_bits;
-        size_t hash_count =  static_cast<size_t>(bp.k_hashes);
-        SimpleBloom bloom{bloom_bits, hash_count};
-        if (bloom.bits > 0){
-            for (const auto &key : freq_map) {
-                if (chosen_set.find(key.first) == chosen_set.end()) {
-                    bloom.insert(key.first);
-                }
+        // num of entries to insert into bloom
+        auto num_entries = freq_map.size() - chosen_set.size();
+        double fp = 0.1; // 10% false positive rate
+        SimpleBloom bloom{num_entries, fp};
+        for (const auto &key : freq_map) {
+            if (chosen_set.find(key.first) == chosen_set.end()) {
+                bloom.FilterInsert(static_cast<uint64_t>(key.first));
             }
         }
+        uint32_t bloom_len = bloom.data.size() * sizeof(BloomBlock);
         // range index
         uint32_t min_key = UINT32_MAX;
         uint32_t max_key = 0;
         for (const auto &key : freq_map) {
-            if (!bloom.might_contain(key.first)) continue;
+            if (!bloom.FilterCheck(static_cast<uint64_t>(key.first))) continue;
             if (chosen_set.find(key.first) == chosen_set.end()) {
                 if (key.first < min_key) min_key = key.first;
                 if (key.first > max_key) max_key = key.first;
             }
         }
         RangeIndex rindex{min_key, max_key};
-        //std::cout << " range index min: " << rindex.Min << " max: " << rindex.Max << std::endl;
-
-        // count-min sketch
-        // uint32_t cms_width_height = static_cast<uint32_t>(remaining_budget/4);
-        // uint32_t cms_width = std::max<uint32_t>(1, 2000);
-        // uint32_t cms_depth = std::max<uint32_t>(1, 5);
-        // // std::cout << " CMS dimensions (width x depth): " << cms_width << " x " << cms_depth << std::endl;
-        // CountMinSketch cms{ cms_width , cms_depth}; // width, depth
-        // std::unordered_set<uint32_t> chosen_set;
-        // chosen_set.reserve(topk.size()*2 + 1);
-        // for (auto &e : topk) chosen_set.insert(e.first);
-        // // insert keys that were not chosen into top-k
-        // for (const auto &key : freq_map) {
-        //     if (chosen_set.find(key.first) == chosen_set.end()) {
-        //         uint32_t cnt = key.second;
-        //         cms.add(key.first, cnt);
-        //     }
-        // }
-        // size_t cms_table_size = cms.width * cms.depth * sizeof(uint32_t);
-        
-        // serialize layout:
-        // [topk_count:uint32][topk keys (delta+varint)][topk freqs (varint sequence)] |[bloom_bits:uint32][bloom_hash:uint32][bloom bytes..] | [range.Min,range.Max] (8 bytes) |
 
         // serialize top-k : sort ascending keys and delta+varint encode
         std::sort(topk.begin(), topk.end(), [](const auto &a, const auto &b){ return a.first < b.first; });
@@ -322,21 +307,14 @@ std::vector<std::byte> build_idx(std::span<const uint32_t> data, Parameters conf
                 write_varuint32(serialized, topk[i].second);
             }
         }
+        
         // serialize bloom filter
-        append_bytes(serialized, &bloom.bits, sizeof(bloom.bits));
-        append_bytes(serialized, &bloom.hash_count, sizeof(bloom.hash_count));
-        if (bloom.bits > 0) append_bytes(serialized, bloom.storage.data(), bloom.storage.size());
+        append_bytes(serialized, &bloom_len ,sizeof(bloom_len));
+        if (bloom_len > 0) append_bytes(serialized, bloom.data.data(), bloom_len);
         
         // serialize range index
         append_bytes(serialized, &rindex.Min, sizeof(rindex.Min));
         append_bytes(serialized, &rindex.Max, sizeof(rindex.Max));
-
-        // serialize count-min sketch
-        // uint32_t chunk_count = static_cast<uint32_t>(data.size());
-        // append_bytes(serialized, &chunk_count, sizeof(chunk_count));
-        // append_bytes(serialized, &cms.width, sizeof(cms.width));
-        // append_bytes(serialized, &cms.depth, sizeof(cms.depth));
-        // append_bytes(serialized, cms.table.data(), cms_table_size);
         return serialized;  
 }
 
@@ -373,23 +351,24 @@ std::optional<size_t> query_idx(uint32_t predicate, const std::vector<std::byte>
         auto it = std::lower_bound(keys.begin(), keys.end(), predicate);
         if (it != keys.end() && *it == predicate) {
             size_t idx = static_cast<size_t>(it - keys.begin());
+            //std::cout << " Predicate " << predicate << " found in top-k with freq " << freqs[idx] << std::endl;
             return static_cast<size_t>(freqs[idx]);
         }
        }
 
         // bloom filter check
-        uint32_t bits;
-        uint32_t hash_count;
-        std::memcpy(&bits, index.data() + offset, sizeof(bits));
-        offset += sizeof(bits);
-        std::memcpy(&hash_count, index.data() + offset, sizeof(hash_count));
-        offset += sizeof(hash_count);
-        if (bits > 0) {
-            size_t bloom_bytes = (bits + 7) / 8;
-            SimpleBloom bloom{bits, hash_count};
-            std::memcpy(bloom.storage.data(), index.data() + offset, bloom_bytes);
-            offset += bloom_bytes;
-            if (!bloom.might_contain(predicate)) {
+        uint32_t bloom_len = 0;
+        std::memcpy(&bloom_len, index.data() + offset, sizeof(bloom_len));
+        offset += sizeof(bloom_len);
+        if (bloom_len > 0) {
+            size_t bloom_count = bloom_len / sizeof(BloomBlock);
+            std::vector<BloomBlock> bloom_blocks;
+            bloom_blocks.resize(bloom_count);
+            std::memcpy(bloom_blocks.data(), index.data() + offset, bloom_len);
+            offset += bloom_len;
+            SimpleBloom bloom{std::move(bloom_blocks)};
+            if (!bloom.FilterCheck(static_cast<uint64_t>(predicate))) {
+                //std::cout<< " Predicate " << predicate << " not in bloom filter" << std::endl;
                 return 0; // definitely not present
             }
         }
@@ -400,37 +379,8 @@ std::optional<size_t> query_idx(uint32_t predicate, const std::vector<std::byte>
         std::memcpy(&rindex.Max, index.data() + offset, sizeof(rindex.Max));
         offset += sizeof(rindex.Max);
         if (predicate < rindex.Min || predicate > rindex.Max) {
-           // std::cout << " Predicate " << predicate << " outside range index [" << rindex.Min << ", " << rindex.Max << "]" << std::endl;
+           //std::cout << " Predicate " << predicate << " outside range index [" << rindex.Min << ", " << rindex.Max << "]" << std::endl;
             return 0; // definitely not present   
         }
-
-       // count min sketch
-    //    uint32_t chunk_count;
-    //    std::memcpy(&chunk_count, index.data() + offset, sizeof(chunk_count));
-    //    offset += sizeof(chunk_count);
-
-    //    uint32_t cms_width;
-    //    uint32_t cms_depth;
-    //    std::memcpy(&cms_width, index.data() + offset, sizeof(cms_width));
-    //    offset += sizeof(cms_width);
-    //     std::memcpy(&cms_depth, index.data() + offset, sizeof(cms_depth));
-    //     offset += sizeof(cms_depth);
-    //     CountMinSketch cms{cms_width, cms_depth};
-    //     size_t cms_table_size = cms_width * cms_depth * sizeof(uint32_t);
-    //     std::memcpy(cms.table.data(), index.data() + offset, cms_table_size);
-    //     offset += cms_table_size;
-    //     size_t estimate = cms.estimate(predicate);
-
-    //     //compute a conservative acceptance
-    //     double econst = 2.71828182845904523536;
-    //     double expected_error = 0.0;
-    //     if (cms_width > 0) expected_error = (econst / double(cms_width)) * double(chunk_count);
-    //     // safety multiplier makes us more conservative (reduce false positives)
-    //     const double safety = 1.5;
-    //     uint32_t threshold = std::max<uint32_t>(1, static_cast<uint32_t>(std::ceil(expected_error * safety)));
-    //     if (estimate > threshold) {
-    //         std::cout << " CMS estimate " << estimate << " > threshold " << threshold << " -> skip with estimate" << std::endl;
-    //         return estimate;
-    //     } 
     return std::nullopt;
 }
